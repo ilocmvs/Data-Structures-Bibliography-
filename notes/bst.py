@@ -67,19 +67,7 @@ class bst:
             return "#"
         return self.serialize(node.left) + "," + str(node.value) + "," + self.serialize(node.right)
 
-    def deserialize(self, data):
-        serialized = data.split(",")
-        i = 0
-        def _deserialize():
-            nonlocal i
-            if i >= len(serialized) or serialized[i] == "#": #cannot work without #
-                return None
-            node = bstNode(serialized[i])
-            i += 1
-            node.left = _deserialize()
-            node.right = _deserialize()
-            return node
-        return _deserialize()
+    #inorder itself is not enough to recover the original tree
 
     #preorder traversal
     def preorder_serialize(self, node):
@@ -94,10 +82,14 @@ class bst:
             nonlocal i
             if i >= len(serialized):
                 return None
-            val = serialized[i] 
-            if val < low or val > high or val == "#":
+            if serialized[i] == "#":
+                i += 1
                 return None
-            node = bstNode(val)
+            val = int(serialized[i])
+            if val <= low or val >= high:
+                i += 1
+                return None
+            node = TreeNode(val)
             i += 1
             node.left = _deserialize(low, val)
             node.right = _deserialize(val, high)
@@ -116,12 +108,15 @@ class bst:
         i = len(serialized) - 1
         def _deserialize(low, high):
             nonlocal i
-            if i >= len(serialized):
+            if i < 0:
                 return None
-            val = serialized[i]
-            if val < low or val > high or val == "#":
+            if serialized[i] == "#":
+                i -= 1
                 return None
-            node = bstNode(val)
+            val = int(serialized[i])
+            if val <= low or val >= high:
+                return None
+            node = TreeNode(val)
             i -= 1
             node.right = _deserialize(val, high)
             node.left = _deserialize(low, val)
@@ -129,7 +124,7 @@ class bst:
         return _deserialize(float('-inf'), float('inf'))
 
     #preorder+inorder deserialize
-    def preorder_inorder_deserialize(self, preorder, inorder):
+    def preorder_inorder_deserialize(self, preorder, inorder): # strings must be without #
         if not preorder or not inorder:
             return None
         root = bstNode(preorder[0])
@@ -139,7 +134,7 @@ class bst:
         return root
     
     #postorder+inorder deserialize
-    def postorder_inorder_deserialize(self, postorder, inorder):
+    def postorder_inorder_deserialize(self, postorder, inorder): # strings must be without #
         if not postorder or not inorder:
             return None
         root = bstNode(postorder[-1])
