@@ -180,7 +180,7 @@ __global__ void transposeTiled(const float *in, float *out, int rows,
 
   // TODO:
   // Load input tile into shared memory.
-  if (/* TODO: y < rows && x < cols */y < rows && x < cols) {
+  if (/* TODO: y < rows && x < cols */ y < rows && x < cols) {
     // TODO:
     // tile[ty][tx] = in[y * cols + x];
     tile[ty][tx] = in[y * cols + x];
@@ -203,6 +203,64 @@ __global__ void transposeTiled(const float *in, float *out, int rows,
   }
 }
 
+__global__ void conv2d_naive_kernel(const float *input, const float *filter,
+                                    float *output, int H, int W, int K,
+                                    int padding, int stride) {
+
+  // input:  H x W matrix, row-major
+  // filter: K x K matrix, row-major, K is odd
+  // output: H x W matrix, row-major
+  //
+
+  int H_out = (H + 2 * padding - K) / stride + 1;
+  int W_out = (W + 2 * padding - K) / stride + 1;
+  // TODO 1:
+  // Compute global output row and column handled by this thread.
+  int row = blockIdx.y * blockDim.y + threadIdx.y;
+  int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+  // TODO 2:
+  // Boundary check: return if this thread is outside output matrix.
+  if (/* TODO */ row >= H_out || col >= W_out) {
+    return;
+  }
+
+  float sum = 0.0f;
+
+  // TODO 3:
+  // Loop over filter window.
+  for (int fr = 0; fr < K; ++fr) {
+    for (int fc = 0; fc < K; ++fc) {
+
+      // TODO 4:
+      // Convert filter coordinate to input coordinate.
+      int in_r = /* TODO */ row * stride + fr - padding;
+      int in_c = /* TODO */ col * stride + fc - padding;
+
+      // TODO 5:
+      // Check whether input coordinate is valid.
+      if (/* TODO */ 0 <= in_r && in_r < H && in_c < W && in_c >= 0) {
+
+        // TODO 6:
+        // Load input value and filter value.
+        float x = /* TODO */ input[in_r * W + in_c];
+        float w = /* TODO */ filter[fr * K + fc];
+
+        // TODO 7:
+        // Accumulate.
+        sum += /* TODO */ x * w;
+      }
+    }
+  }
+
+  // TODO 8:
+  // Store result.
+  output[/* TODO */ row * W_out + col] = sum;
+}
+
+
+
+/* CPU verifications */
 void matrixAddCPU(const std::vector<float> &A, const std::vector<float> &B,
                   std::vector<float> &C, int rows, int cols) {
   for (int row = 0; row < rows; ++row) {

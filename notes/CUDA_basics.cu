@@ -100,6 +100,11 @@ __global__ void reduceSumBlock(const float *x, float *partialSums, int N) {
   }
 }
 
+auto launchSum = [](const float *d_in, float *d_out, int N, int gridSize,
+                    int blockSize, size_t sharedBytes, cudaStream_t stream) {
+  reduceSumBlock<<<gridSize, blockSize, sharedBytes, stream>>>(d_in, d_out, N);
+};
+
 __global__ void reduceMaxBlock(const float *x, float *partialMax, int N) {
   extern __shared__ float sdata[];
 
@@ -133,6 +138,59 @@ __global__ void reduceMaxBlock(const float *x, float *partialMax, int N) {
   }
 }
 
+auto launchMax = [](const float *d_in, float *d_out, int N, int gridSize,
+                    int blockSize, size_t sharedBytes, cudaStream_t stream) {
+  reduceMaxBlock<<<gridSize, blockSize, sharedBytes, stream>>>(d_in, d_out, N);
+};
+
+template <typename LaunchKernel>
+void reduceOperationRecursive(const float *d_x, float *d_result, int N,
+                              int blockSize, LaunchKernel launchKernel,
+                              cudaStream_t stream = 0) {
+  if (N <= 0) {
+    cudaMemsetAsync(d_result, 0, sizeof(float), stream);
+    return;
+  }
+
+  if (N == 1) {
+    cudaMemcpyAsync(d_result, d_x, sizeof(float), cudaMemcpyDeviceToDevice,
+                    stream);
+    return;
+  }
+
+  int maxGridSize = (N + blockSize - 1) / blockSize;
+
+  float *d_tempA = nullptr;
+  float *d_tempB = nullptr;
+
+  cudaMalloc((void **)&d_tempA, maxGridSize * sizeof(float));
+  cudaMalloc((void **)&d_tempB, maxGridSize * sizeof(float));
+
+  const float *d_in = d_x;
+  float *d_out = d_tempA;
+
+  int curN = N;
+
+  while (curN > 1) {
+    int gridSize = (curN + blockSize - 1) / blockSize;
+    size_t sharedBytes = blockSize * sizeof(float);
+
+    launchKernel(d_in, d_out, curN, gridSize, blockSize, sharedBytes, stream);
+
+    curN = gridSize;
+
+    const float *nextIn = d_out;
+    d_out = (d_out == d_tempA) ? d_tempB : d_tempA;
+    d_in = nextIn;
+  }
+
+  cudaMemcpyAsync(d_result, d_in, sizeof(float), cudaMemcpyDeviceToDevice,
+                  stream);
+
+  cudaFree(d_tempA);
+  cudaFree(d_tempB);
+}
+
 __global__ void softmax1DOneBlock(const float *x, float *y, int N) {
   extern __shared__ float sdata[];
 
@@ -161,7 +219,7 @@ __global__ void softmax1DOneBlock(const float *x, float *y, int N) {
   // TODO:
   // Reduce to find max.
   for (int offset = blockDim.x / 2; offset > 0; offset /= 2) {
-    if (/* TODO */tid < offset) {
+    if (/* TODO */ tid < offset) {
       // TODO
       sdata[tid] = fmaxf(sdata[tid], sdata[tid + offset]);
     }
@@ -193,7 +251,7 @@ __global__ void softmax1DOneBlock(const float *x, float *y, int N) {
   // TODO:
   // Reduce sum.
   for (int offset = blockDim.x / 2; offset > 0; offset /= 2) {
-    if (/* TODO */tid < offset) {
+    if (/* TODO */ tid < offset) {
       // TODO
       sdata[tid] += sdata[tid + offset];
     }
@@ -215,16 +273,277 @@ __global__ void softmax1DOneBlock(const float *x, float *y, int N) {
   }
 }
 
+__global__ void histogramAtomicGlobal(const unsigned char *data, int *hist,
+                                      int N) {
+  int gid = blockIdx.x * blockDim.x + threadIdx.x;
+  int stride = blockDim.x * gridDim.x;
 
+  for (int i = gid; i < N; i += stride) {
+    unsigned char value = data[i];
 
+    // TODO:
+    // Safely increment hist[value].
+    // Hint: atomicAdd
+    atomicAdd(&hist[value], 1);
+  }
+}
 
+__global__ void histogramAtomicShared(const unsigned char *data, int *hist,
+                                      int N) {
+  __shared__ int localHist[HIST_BINS];
 
+  int tid = threadIdx.x;
+  int gid = blockIdx.x * blockDim.x + threadIdx.x;
+  int stride = blockDim.x * gridDim.x;
 
+  // TODO:
+  // Initialize localHist using block threads.
+  for (int bin = tid; bin < HIST_BINS; bin += blockDim.x) {
+    // TODO:
+    // localHist[bin] = 0;
+    localHist[bin] = 0;
+  }
 
+  __syncthreads();
+
+  // TODO:
+  // Build per-block histogram in shared memory.
+  for (int i = gid; i < N; i += stride) {
+    unsigned char value = data[i];
+
+    // TODO:
+    // atomicAdd to localHist[value]
+    atomicAdd(localHist[value], 1);
+  }
+
+  __syncthreads();
+
+  // TODO:
+  // Merge localHist into global hist.
+  for (int bin = tid; bin < HIST_BINS; bin += blockDim.x) {
+    // TODO:
+    // atomicAdd(&hist[bin], localHist[bin]);
+    atomicAdd(&hist[bin], localHist[bin]);
+  }
+}
+
+__global__ void inclusiveScanBlock(const float *x, float *y, int N) {
+  extern __shared__ float sdata[];
+
+  int tid = threadIdx.x;
+  int gid = blockIdx.x * blockDim.x + threadIdx.x;
+
+  // TODO:
+  // Load data into shared memory.
+  if (gid < N) {
+    sdata[tid] = x[gid];
+  } else {
+    sdata[tid] = 0.0f;
+  }
+
+  __syncthreads();
+
+  // TODO:
+  // Inclusive scan inside block.
+  for (int offset = 1; offset < blockDim.x; offset *= 2) {
+    float val = 0.0f;
+
+    if (tid >= offset) {
+      // TODO:
+      // val = sdata[tid - offset];
+      val = sdata[tid - offset];
+    }
+
+    __syncthreads();
+
+    // TODO:
+    // Add val to sdata[tid].
+    if (tid >= offset) {
+      // TODO
+      sdata[tid] += val;
+    }
+
+    __syncthreads();
+  }
+
+  // TODO:
+  // Write result.
+  if (gid < N) {
+    y[gid] = sdata[tid];
+  }
+}
+
+__global__ void layerNormForwardKernel(const float *__restrict__ X,
+                                       const float *__restrict__ gamma,
+                                       const float *__restrict__ beta,
+                                       float *__restrict__ Y, int num_rows,
+                                       int hidden_dim, float eps) {
+  // X:     [num_rows, hidden_dim]
+  // gamma: [hidden_dim]
+  // beta:  [hidden_dim]
+  // Y:     [num_rows, hidden_dim]
+  //
+  // One block handles one row.
+  // Threads inside the block reduce across hidden_dim.
+  int row = blockIdx.x;
+  int tid = threadIdx.x;
+
+  if (row >= num_rows)
+    return;
+
+  extern __shared__ float shared[];
+  float *s_sum = shared;                // size: blockDim.x
+  float *s_sumsq = shared + blockDim.x; // size: blockDim.x
+
+  const float *x_row = X + row * hidden_dim;
+  float *y_row = Y + row * hidden_dim;
+
+  float local_sum = 0.0f;
+  float local_sumsq = 0.0f;
+
+  // ------------------------------------------------------------
+  // TODO 1:
+  // Each thread loops over part of the row:
+  //
+  // for (int col = tid; col < hidden_dim; col += blockDim.x)
+  //
+  // Accumulate:
+  //   local_sum   += x
+  //   local_sumsq += x * x
+  // ------------------------------------------------------------
+
+  for (int col = tid; col < hidden_dim; col += blockDim.x) {
+    // TODO:
+    // float v = ...
+    // local_sum += ...
+    // local_sumsq += ...
+    float v = x_row[col];
+    local_sum += v;
+    local_sumsq += v * v;
+  }
+
+  // Store partial sums into shared memory
+  s_sum[tid] = local_sum;
+  s_sumsq[tid] = local_sumsq;
+
+  __syncthreads();
+
+  // ------------------------------------------------------------
+  // TODO 2:
+  // Reduce s_sum and s_sumsq across the block.
+  //
+  // Standard shared-memory reduction:
+  //
+  // for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+  //     if (tid < stride) {
+  //         s_sum[tid]   += s_sum[tid + stride];
+  //         s_sumsq[tid] += s_sumsq[tid + stride];
+  //     }
+  //     __syncthreads();
+  // }
+  //
+  // Assumption: blockDim.x is power of 2.
+  // ------------------------------------------------------------
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    // TODO:
+    // if (tid < stride) { ... }
+    // __syncthreads();
+    if (tid < stride) {
+      s_sum[tid] += s_sum[tid + stride];
+      s_sumsq[tid] += s_sumsq[tid + stride];
+    }
+    __syncthreads();
+  }
+
+  // ------------------------------------------------------------
+  // TODO 3:
+  // Thread 0 computes mean and inverse std.
+  //
+  // mean = sum / hidden_dim
+  // var  = sumsq / hidden_dim - mean * mean
+  // inv_std = rsqrtf(var + eps)
+  //
+  // Store mean and inv_std back into shared memory so all threads
+  // can use them.
+  // ------------------------------------------------------------
+
+  if (tid == 0) {
+    // TODO:
+    // float mean = ...
+    // float var = ...
+    // float inv_std = ...
+    //
+    // s_sum[0] = mean;
+    // s_sumsq[0] = inv_std;
+    float mean = s_sum[0] / hidden_dim;
+    float var = s_sumsq[0] / hidden_dim - mean * mean;
+    var = fmaxf(var, 0.0f);
+    float inv_std = rsqrtf(var + eps);
+
+    s_sum[0] = mean;
+    s_sumsq[0] = inv_std;
+  }
+
+  __syncthreads();
+
+  float mean = s_sum[0];
+  float inv_std = s_sumsq[0];
+
+  // ------------------------------------------------------------
+  // TODO 4:
+  // Normalize the row.
+  //
+  // y = gamma[col] * (x - mean) * inv_std + beta[col]
+  //
+  // Again use a strided loop:
+  //
+  // for (int col = tid; col < hidden_dim; col += blockDim.x)
+  // ------------------------------------------------------------
+
+  for (int col = tid; col < hidden_dim; col += blockDim.x) {
+    // TODO:
+    // float v = ...
+    // float g = gamma[col];
+    // float b = beta[col];
+    // y_row[col] = ...
+    float v = x_row[col];
+    float g = gamma[col];
+    float b = beta[col];
+    y_row[col] = g * (v - mean) * inv_std + b;
+  }
+}
+
+/* CPU verifications */
 void vectorAddCPU(const std::vector<float> &A, const std::vector<float> &B,
                   std::vector<float> &C) {
   for (size_t i = 0; i < A.size(); ++i) {
     C[i] = A[i] + B[i];
+  }
+}
+
+void layerNormForwardCPU(const float *X, const float *gamma, const float *beta,
+                         float *Y, int num_rows, int hidden_dim, float eps) {
+  for (int row = 0; row < num_rows; ++row) {
+    const float *x_row = X + row * hidden_dim;
+    float *y_row = Y + row * hidden_dim;
+
+    float sum = 0.0f;
+    float sumsq = 0.0f;
+
+    for (int col = 0; col < hidden_dim; ++col) {
+      float v = x_row[col];
+      sum += v;
+      sumsq += v * v;
+    }
+
+    float mean = sum / hidden_dim;
+    float var = sumsq / hidden_dim - mean * mean;
+    float inv_std = 1.0f / std::sqrt(var + eps);
+
+    for (int col = 0; col < hidden_dim; ++col) {
+      y_row[col] = gamma[col] * (x_row[col] - mean) * inv_std + beta[col];
+    }
   }
 }
 
@@ -244,10 +563,6 @@ bool checkResult(const std::vector<float> &gpu, const std::vector<float> &cpu,
 
   return true;
 }
-
-
-
-
 
 int main() {
   const int N = 1 << 20; // about one million elements
