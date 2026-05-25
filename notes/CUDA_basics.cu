@@ -11,10 +11,15 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
 #include <vector>
+#include <iomanip>
+
+constexpr int HIST_BINS = 256;
 
 #define CHECK_CUDA(call)                                                       \
   do {                                                                         \
@@ -133,7 +138,7 @@ __global__ void reduceMaxBlock(const float *x, float *partialMax, int N) {
 
   // TODO:
   // Write block max.
-  if (/* TODO */) {
+  if (tid == 0) {
     partialMax[blockIdx.x] = sdata[0];
   }
 }
@@ -313,7 +318,7 @@ __global__ void histogramAtomicShared(const unsigned char *data, int *hist,
 
     // TODO:
     // atomicAdd to localHist[value]
-    atomicAdd(localHist[value], 1);
+    atomicAdd(&localHist[value], 1);
   }
 
   __syncthreads();
@@ -522,6 +527,81 @@ void vectorAddCPU(const std::vector<float> &A, const std::vector<float> &B,
   }
 }
 
+float reduceSumCPU(const std::vector<float> &x) {
+  float sum = 0.0f;
+  for (float v : x) {
+    sum += v;
+  }
+  return sum;
+}
+
+float reduceMaxCPU(const std::vector<float> &x) {
+  float mx = -FLT_MAX;
+  for (float v : x) {
+    mx = std::fmax(mx, v);
+  }
+  return mx;
+}
+
+void softmax1DCPU(const std::vector<float> &x, std::vector<float> &y) {
+  const int N = static_cast<int>(x.size());
+  y.resize(N);
+
+  float maxVal = reduceMaxCPU(x);
+  float denom = 0.0f;
+  for (int i = 0; i < N; ++i) {
+    denom += std::exp(x[i] - maxVal);
+  }
+
+  for (int i = 0; i < N; ++i) {
+    y[i] = std::exp(x[i] - maxVal) / denom;
+  }
+}
+
+void histogramCPU(const std::vector<unsigned char> &data, std::vector<int> &hist,
+                  int bins) {
+  hist.assign(bins, 0);
+  for (unsigned char value : data) {
+    ++hist[value];
+  }
+}
+
+void inclusiveScanBlockCPU(const std::vector<float> &x, std::vector<float> &y,
+                           int blockSize) {
+  const int N = static_cast<int>(x.size());
+  y.assign(N, 0.0f);
+
+  const int numBlocks = (N + blockSize - 1) / blockSize;
+  std::vector<float> block(static_cast<size_t>(blockSize));
+
+  for (int b = 0; b < numBlocks; ++b) {
+    std::fill(block.begin(), block.end(), 0.0f);
+    for (int tid = 0; tid < blockSize; ++tid) {
+      const int gid = b * blockSize + tid;
+      if (gid < N) {
+        block[static_cast<size_t>(tid)] = x[static_cast<size_t>(gid)];
+      }
+    }
+
+    for (int offset = 1; offset < blockSize; offset *= 2) {
+      std::vector<float> prev = block;
+      for (int tid = 0; tid < blockSize; ++tid) {
+        if (tid >= offset) {
+          block[static_cast<size_t>(tid)] +=
+              prev[static_cast<size_t>(tid - offset)];
+        }
+      }
+    }
+
+    for (int tid = 0; tid < blockSize; ++tid) {
+      const int gid = b * blockSize + tid;
+      if (gid < N) {
+        y[static_cast<size_t>(gid)] = block[static_cast<size_t>(tid)];
+      }
+    }
+  }
+}
+
 void layerNormForwardCPU(const float *X, const float *gamma, const float *beta,
                          float *Y, int num_rows, int hidden_dim, float eps) {
   for (int row = 0; row < num_rows; ++row) {
@@ -532,31 +612,35 @@ void layerNormForwardCPU(const float *X, const float *gamma, const float *beta,
     float sumsq = 0.0f;
 
     for (int col = 0; col < hidden_dim; ++col) {
-      float v = x_row[col];
+      const float v = x_row[col];
       sum += v;
       sumsq += v * v;
     }
 
-    float mean = sum / hidden_dim;
+    const float mean = sum / hidden_dim;
     float var = sumsq / hidden_dim - mean * mean;
-    float inv_std = 1.0f / std::sqrt(var + eps);
+    var = std::fmax(var, 0.0f);
+    const float inv_std = 1.0f / std::sqrt(var + eps);
 
     for (int col = 0; col < hidden_dim; ++col) {
-      y_row[col] = gamma[col] * (x_row[col] - mean) * inv_std + beta[col];
+      y_row[col] =
+          gamma[col] * (x_row[col] - mean) * inv_std + beta[col];
     }
   }
 }
 
 bool checkResult(const std::vector<float> &gpu, const std::vector<float> &cpu,
-                 float eps = 1e-5f) {
+                 float tol = 1e-5f, const char *label = "result") {
   if (gpu.size() != cpu.size()) {
+    std::cerr << label << ": size mismatch (GPU=" << gpu.size()
+              << ", CPU=" << cpu.size() << ")" << std::endl;
     return false;
   }
 
   for (size_t i = 0; i < gpu.size(); ++i) {
-    if (std::fabs(gpu[i] - cpu[i]) > eps) {
-      std::cerr << "Mismatch at index " << i << ": GPU = " << gpu[i]
-                << ", CPU = " << cpu[i] << std::endl;
+    if (std::fabs(gpu[i] - cpu[i]) > tol) {
+      std::cerr << label << ": mismatch at index " << i << " GPU=" << gpu[i]
+                << " CPU=" << cpu[i] << std::endl;
       return false;
     }
   }
@@ -564,103 +648,335 @@ bool checkResult(const std::vector<float> &gpu, const std::vector<float> &cpu,
   return true;
 }
 
-int main() {
-  const int N = 1 << 20; // about one million elements
+bool checkScalar(float gpu, float cpu, float tol = 1e-3f,
+                 const char *label = "scalar") {
+  if (std::fabs(gpu - cpu) > tol) {
+    std::cerr << std::setprecision(10) << label << ": GPU=" << gpu << " CPU=" << cpu << std::endl;
+    return false;
+  }
+  return true;
+}
+
+bool checkHistogram(const std::vector<int> &gpu, const std::vector<int> &cpu,
+                    const char *label = "histogram") {
+  if (gpu.size() != cpu.size()) {
+    std::cerr << label << ": size mismatch" << std::endl;
+    return false;
+  }
+
+  for (size_t i = 0; i < gpu.size(); ++i) {
+    if (gpu[i] != cpu[i]) {
+      std::cerr << label << ": mismatch at bin " << i << " GPU=" << gpu[i]
+                << " CPU=" << cpu[i] << std::endl;
+      return false;
+    }
+  }
+
+  return true;
+}
+
+void fillVectorAddInputs(int N, std::vector<float> &A, std::vector<float> &B) {
+  A.resize(N);
+  B.resize(N);
+  for (int i = 0; i < N; ++i) {
+    A[static_cast<size_t>(i)] = static_cast<float>(i) * 0.5f;
+    B[static_cast<size_t>(i)] = static_cast<float>(i) * 2.0f;
+  }
+}
+
+bool verifyVectorAddKernel(const char *name,
+                           void (*launch)(float *, float *, float *, int, int,
+                                          int)) {
+  const int N = 1 << 16;
   const size_t bytes = N * sizeof(float);
 
-  std::vector<float> h_A(N);
-  std::vector<float> h_B(N);
-  std::vector<float> h_C(N, 0.0f);
-  std::vector<float> h_ref(N, 0.0f);
-
-  // Initialize input data on host.
-  for (int i = 0; i < N; ++i) {
-    h_A[i] = static_cast<float>(i) * 0.5f;
-    h_B[i] = static_cast<float>(i) * 2.0f;
-  }
+  std::vector<float> h_A, h_B, h_C(N, 0.0f), h_ref(N, 0.0f);
+  fillVectorAddInputs(N, h_A, h_B);
+  vectorAddCPU(h_A, h_B, h_ref);
 
   float *d_A = nullptr;
   float *d_B = nullptr;
   float *d_C = nullptr;
-
-  // TODO 2:
-  // Allocate GPU memory for d_A, d_B, and d_C.
-  //
-  // Hint:
-  //   cudaMalloc((void**)&d_A, bytes);
-  //
-  // CHECK_CUDA(...);
   CHECK_CUDA(cudaMalloc((void **)&d_A, bytes));
   CHECK_CUDA(cudaMalloc((void **)&d_B, bytes));
   CHECK_CUDA(cudaMalloc((void **)&d_C, bytes));
+  CHECK_CUDA(
+      cudaMemcpy(d_A, h_A.data(), bytes, cudaMemcpyHostToDevice));
+  CHECK_CUDA(
+      cudaMemcpy(d_B, h_B.data(), bytes, cudaMemcpyHostToDevice));
 
-  // TODO 3:
-  // Copy h_A and h_B from host to device.
-  //
-  // Hint:
-  //   cudaMemcpy(d_A, h_A.data(), bytes, cudaMemcpyHostToDevice);
-  //
-  // CHECK_CUDA(...);
-  CHECK_CUDA(cudaMemCpy(d_A, h_A.data(), bytes, cudaMemCpyHostToDevice));
-  CHECK_CUDA(cudaMemCpy(d_B, h_B.data(), bytes, cudaMemCpyHostToDevice));
+  const int blockSize = 256;
+  const int gridSize = (N + blockSize - 1) / blockSize;
+  launch(d_A, d_B, d_C, N, gridSize, blockSize);
+  CHECK_CUDA(cudaGetLastError());
+  CHECK_CUDA(cudaDeviceSynchronize());
+  CHECK_CUDA(
+      cudaMemcpy(h_C.data(), d_C, bytes, cudaMemcpyDeviceToHost));
 
-  // TODO 4:
-  // Choose a reasonable block size and grid size.
-  //
-  // Common choice:
-  //   blockSize = 256
-  //   gridSize = (N + blockSize - 1) / blockSize
-  int blockSize = 256;                            // TODO
-  int gridSize = (N + blockSize - 1) / blockSize; // TODO
-
-  // TODO 5:
-  // Launch the kernel.
-  //
-  // Hint:
-  //   vectorAddKernel<<<gridSize, blockSize>>>(d_A, d_B, d_C, N);
-  vectorAddKernel<<<gridSize, blockSize>>>(d_A, d_B, d_C, N);
-
-  // TODO 6:
-  // Check whether the kernel launch failed.
-  //
-  // Hint:
-  //   cudaGetLastError()
-  cudaGetLastError();
-
-  // TODO 7:
-  // Synchronize the device before reading results.
-  //
-  // Hint:
-  //   cudaDeviceSynchronize()
-  cudaDeviceSynchronize();
-
-  // TODO 8:
-  // Copy d_C back from device to host.
-  //
-  // Hint:
-  //   cudaMemcpy(h_C.data(), d_C, bytes, cudaMemcpyDeviceToHost);
-  cudaMemCpy(h_C.data(), d_C, bytes, cudaMemCpyDeviceToHost);
-
-  // Compute CPU reference result.
-  vectorAddCPU(h_A, h_B, h_ref);
-
-  // Validate result.
-  if (checkResult(h_C, h_ref)) {
-    std::cout << "PASS: GPU result matches CPU result." << std::endl;
-  } else {
-    std::cout << "FAIL: GPU result does not match CPU result." << std::endl;
-  }
-
-  // TODO 9:
-  // Free GPU memory.
-  //
-  // Hint:
-  //   cudaFree(d_A);
-  //   cudaFree(d_B);
-  //   cudaFree(d_C);
+  const bool ok = checkResult(h_C, h_ref, 1e-5f, name);
   cudaFree(d_A);
   cudaFree(d_B);
   cudaFree(d_C);
+  return ok;
+}
 
-  return 0;
+void launchVectorAddKernel(float *d_A, float *d_B, float *d_C, int N,
+                           int gridSize, int blockSize) {
+  vectorAddKernel<<<gridSize, blockSize>>>(d_A, d_B, d_C, N);
+}
+
+void launchVectorAddGridStride(float *d_A, float *d_B, float *d_C, int N,
+                               int gridSize, int blockSize) {
+  vectorAddGridStride<<<gridSize, blockSize>>>(d_A, d_B, d_C, N);
+}
+
+bool verifyReduceSum() {
+  const int N = 1 << 18;
+  const size_t bytes = N * sizeof(float);
+
+  std::vector<float> h_x(N);
+  for (int i = 0; i < N; ++i) {
+    h_x[static_cast<size_t>(i)] =
+        std::sin(static_cast<float>(i) * 0.001f);
+  }
+
+  float *d_x = nullptr;
+  float *d_out = nullptr;
+  CHECK_CUDA(cudaMalloc((void **)&d_x, bytes));
+  CHECK_CUDA(cudaMalloc((void **)&d_out, sizeof(float)));
+  CHECK_CUDA(
+      cudaMemcpy(d_x, h_x.data(), bytes, cudaMemcpyHostToDevice));
+
+  const int blockSize = 256;
+  reduceOperationRecursive(d_x, d_out, N, blockSize, launchSum);
+
+  float gpuSum = 0.0f;
+  CHECK_CUDA(cudaMemcpy(&gpuSum, d_out, sizeof(float),
+                        cudaMemcpyDeviceToHost));
+  const float cpuSum = reduceSumCPU(h_x);
+
+  cudaFree(d_x);
+  cudaFree(d_out);
+  return checkScalar(gpuSum, cpuSum, 1e-2f, "reduceSum");
+}
+
+bool verifyReduceMax() {
+  const int N = 1 << 18;
+  const size_t bytes = N * sizeof(float);
+
+  std::vector<float> h_x(N);
+  for (int i = 0; i < N; ++i) {
+    h_x[static_cast<size_t>(i)] =
+        std::cos(static_cast<float>(i) * 0.002f);
+  }
+
+  float *d_x = nullptr;
+  float *d_out = nullptr;
+  CHECK_CUDA(cudaMalloc((void **)&d_x, bytes));
+  CHECK_CUDA(cudaMalloc((void **)&d_out, sizeof(float)));
+  CHECK_CUDA(
+      cudaMemcpy(d_x, h_x.data(), bytes, cudaMemcpyHostToDevice));
+
+  const int blockSize = 256;
+  reduceOperationRecursive(d_x, d_out, N, blockSize, launchMax);
+
+  float gpuMax = 0.0f;
+  CHECK_CUDA(cudaMemcpy(&gpuMax, d_out, sizeof(float),
+                        cudaMemcpyDeviceToHost));
+  const float cpuMax = reduceMaxCPU(h_x);
+
+  cudaFree(d_x);
+  cudaFree(d_out);
+  return checkScalar(gpuMax, cpuMax, 1e-5f, "reduceMax");
+}
+
+bool verifySoftmax1D() {
+  const int N = 512;
+  const int blockSize = 512;
+  const size_t bytes = N * sizeof(float);
+
+  std::vector<float> h_x(N), h_y(N, 0.0f), h_ref(N, 0.0f);
+  for (int i = 0; i < N; ++i) {
+    h_x[static_cast<size_t>(i)] =
+        std::sin(static_cast<float>(i) * 0.01f);
+  }
+  softmax1DCPU(h_x, h_ref);
+
+  float *d_x = nullptr;
+  float *d_y = nullptr;
+  CHECK_CUDA(cudaMalloc((void **)&d_x, bytes));
+  CHECK_CUDA(cudaMalloc((void **)&d_y, bytes));
+  CHECK_CUDA(
+      cudaMemcpy(d_x, h_x.data(), bytes, cudaMemcpyHostToDevice));
+
+  const size_t sharedBytes = blockSize * sizeof(float);
+  softmax1DOneBlock<<<1, blockSize, sharedBytes>>>(d_x, d_y, N);
+  CHECK_CUDA(cudaGetLastError());
+  CHECK_CUDA(cudaDeviceSynchronize());
+  CHECK_CUDA(
+      cudaMemcpy(h_y.data(), d_y, bytes, cudaMemcpyDeviceToHost));
+
+  cudaFree(d_x);
+  cudaFree(d_y);
+  return checkResult(h_y, h_ref, 1e-5f, "softmax1D");
+}
+
+bool verifyHistogram(bool useShared) {
+  const int N = 1 << 20;
+  const size_t dataBytes = N * sizeof(unsigned char);
+  const size_t histBytes = HIST_BINS * sizeof(int);
+
+  std::vector<unsigned char> h_data(N);
+  for (int i = 0; i < N; ++i) {
+    h_data[static_cast<size_t>(i)] =
+        static_cast<unsigned char>(i % HIST_BINS);
+  }
+
+  std::vector<int> h_hist(HIST_BINS, 0), h_ref(HIST_BINS, 0);
+  histogramCPU(h_data, h_ref, HIST_BINS);
+
+  unsigned char *d_data = nullptr;
+  int *d_hist = nullptr;
+  CHECK_CUDA(cudaMalloc((void **)&d_data, dataBytes));
+  CHECK_CUDA(cudaMalloc((void **)&d_hist, histBytes));
+  CHECK_CUDA(cudaMemcpy(d_data, h_data.data(), dataBytes,
+                        cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemset(d_hist, 0, histBytes));
+
+  const int blockSize = 256;
+  const int gridSize = (N + blockSize - 1) / blockSize;
+  if (useShared) {
+    histogramAtomicShared<<<gridSize, blockSize>>>(d_data, d_hist, N);
+  } else {
+    histogramAtomicGlobal<<<gridSize, blockSize>>>(d_data, d_hist, N);
+  }
+  CHECK_CUDA(cudaGetLastError());
+  CHECK_CUDA(cudaDeviceSynchronize());
+  CHECK_CUDA(cudaMemcpy(h_hist.data(), d_hist, histBytes,
+                        cudaMemcpyDeviceToHost));
+
+  cudaFree(d_data);
+  cudaFree(d_hist);
+  return checkHistogram(h_hist, h_ref,
+                        useShared ? "histogramShared" : "histogramGlobal");
+}
+
+bool verifyInclusiveScanBlock() {
+  const int N = 4096;
+  const int blockSize = 256;
+  const size_t bytes = N * sizeof(float);
+
+  std::vector<float> h_x(N), h_y(N, 0.0f), h_ref(N, 0.0f);
+  for (int i = 0; i < N; ++i) {
+    h_x[static_cast<size_t>(i)] = static_cast<float>((i % 17) - 8);
+  }
+  inclusiveScanBlockCPU(h_x, h_ref, blockSize);
+
+  float *d_x = nullptr;
+  float *d_y = nullptr;
+  CHECK_CUDA(cudaMalloc((void **)&d_x, bytes));
+  CHECK_CUDA(cudaMalloc((void **)&d_y, bytes));
+  CHECK_CUDA(
+      cudaMemcpy(d_x, h_x.data(), bytes, cudaMemcpyHostToDevice));
+
+  const int gridSize = (N + blockSize - 1) / blockSize;
+  const size_t sharedBytes = blockSize * sizeof(float);
+  inclusiveScanBlock<<<gridSize, blockSize, sharedBytes>>>(d_x, d_y, N);
+  CHECK_CUDA(cudaGetLastError());
+  CHECK_CUDA(cudaDeviceSynchronize());
+  CHECK_CUDA(
+      cudaMemcpy(h_y.data(), d_y, bytes, cudaMemcpyDeviceToHost));
+
+  cudaFree(d_x);
+  cudaFree(d_y);
+  return checkResult(h_y, h_ref, 1e-5f, "inclusiveScanBlock");
+}
+
+bool verifyLayerNorm() {
+  const int num_rows = 32;
+  const int hidden_dim = 128;
+  const int blockSize = 128;
+  const float eps = 1e-5f;
+  const size_t matBytes =
+      static_cast<size_t>(num_rows) * hidden_dim * sizeof(float);
+  const size_t vecBytes = hidden_dim * sizeof(float);
+
+  std::vector<float> h_X(static_cast<size_t>(num_rows) * hidden_dim);
+  std::vector<float> h_gamma(hidden_dim, 1.0f);
+  std::vector<float> h_beta(hidden_dim, 0.0f);
+  std::vector<float> h_Y(h_X.size(), 0.0f);
+  std::vector<float> h_ref(h_X.size(), 0.0f);
+
+  for (int i = 0; i < static_cast<int>(h_X.size()); ++i) {
+    h_X[static_cast<size_t>(i)] =
+        std::sin(static_cast<float>(i) * 0.03f);
+  }
+  for (int i = 0; i < hidden_dim; ++i) {
+    h_gamma[static_cast<size_t>(i)] = 0.5f + 0.01f * i;
+    h_beta[static_cast<size_t>(i)] = -0.1f + 0.005f * i;
+  }
+
+  layerNormForwardCPU(h_X.data(), h_gamma.data(), h_beta.data(),
+                      h_ref.data(), num_rows, hidden_dim, eps);
+
+  float *d_X = nullptr;
+  float *d_gamma = nullptr;
+  float *d_beta = nullptr;
+  float *d_Y = nullptr;
+  CHECK_CUDA(cudaMalloc((void **)&d_X, matBytes));
+  CHECK_CUDA(cudaMalloc((void **)&d_gamma, vecBytes));
+  CHECK_CUDA(cudaMalloc((void **)&d_beta, vecBytes));
+  CHECK_CUDA(cudaMalloc((void **)&d_Y, matBytes));
+  CHECK_CUDA(cudaMemcpy(d_X, h_X.data(), matBytes, cudaMemcpyHostToDevice));
+  CHECK_CUDA(
+      cudaMemcpy(d_gamma, h_gamma.data(), vecBytes, cudaMemcpyHostToDevice));
+  CHECK_CUDA(
+      cudaMemcpy(d_beta, h_beta.data(), vecBytes, cudaMemcpyHostToDevice));
+
+  const size_t sharedBytes = 2 * blockSize * sizeof(float);
+  layerNormForwardKernel<<<num_rows, blockSize, sharedBytes>>>(
+      d_X, d_gamma, d_beta, d_Y, num_rows, hidden_dim, eps);
+  CHECK_CUDA(cudaGetLastError());
+  CHECK_CUDA(cudaDeviceSynchronize());
+  CHECK_CUDA(cudaMemcpy(h_Y.data(), d_Y, matBytes, cudaMemcpyDeviceToHost));
+
+  cudaFree(d_X);
+  cudaFree(d_gamma);
+  cudaFree(d_beta);
+  cudaFree(d_Y);
+  return checkResult(h_Y, h_ref, 1e-4f, "layerNorm");
+}
+
+int main() {
+  int failures = 0;
+
+  auto report = [&](const char *name, bool ok) {
+    if (ok) {
+      std::cout << "PASS: " << name << std::endl;
+    } else {
+      std::cout << "FAIL: " << name << std::endl;
+      ++failures;
+    }
+  };
+
+  report("vectorAddKernel",
+         verifyVectorAddKernel("vectorAddKernel", launchVectorAddKernel));
+  report("vectorAddGridStride",
+         verifyVectorAddKernel("vectorAddGridStride",
+                               launchVectorAddGridStride));
+  report("reduceSum", verifyReduceSum());
+  report("reduceMax", verifyReduceMax());
+  report("softmax1D", verifySoftmax1D());
+  report("histogramAtomicGlobal", verifyHistogram(false));
+  report("histogramAtomicShared", verifyHistogram(true));
+  report("inclusiveScanBlock", verifyInclusiveScanBlock());
+  report("layerNormForward", verifyLayerNorm());
+
+  if (failures == 0) {
+    std::cout << "All kernel checks passed." << std::endl;
+    return 0;
+  }
+
+  std::cout << failures << " kernel check(s) failed." << std::endl;
+  return 1;
 }
