@@ -196,6 +196,87 @@ void reduceOperationRecursive(const float *d_x, float *d_result, int N,
   cudaFree(d_tempB);
 }
 
+//warp-level reduction
+__inline__ __device__ float warpReduceSum(float val) {
+  unsigned mask = 0xffffffff;
+
+  for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+      val += __shfl_down_sync(mask, val, offset);
+  }
+
+  return val;
+}
+
+__inline__ __device__ float blockReduceSum(float val) {
+  // Maximum 1024 threads per block -> 1024 / 32 = 32 warps
+  __shared__ float warpSums[32];
+
+  int tid  = threadIdx.x;
+  int lane = tid % warpSize;
+  int wid  = tid / warpSize;
+
+  // First reduce inside each warp
+  val = warpReduceSum(val);
+
+  // Lane 0 of each warp writes its warp result
+  if (lane == 0) {
+      warpSums[wid] = val;
+  }
+
+  __syncthreads();
+
+  // First warp reduces all warp-level partial sums
+  float blockSum = 0.0f;
+
+  int numWarps = (blockDim.x + warpSize - 1) / warpSize;
+
+  if (wid == 0) {
+      blockSum = (lane < numWarps) ? warpSums[lane] : 0.0f;
+      blockSum = warpReduceSum(blockSum);
+  }
+
+  return blockSum;
+}
+
+__global__ void reducePass1(const float* input, float* partial, int N) {
+  float sum = 0.0f;
+
+  int tid = threadIdx.x;
+  int blockStart = blockIdx.x * blockDim.x * 2;
+
+  int i = blockStart + tid;
+
+  // Load two elements per thread for better memory bandwidth usage
+  if (i < N) {
+      sum += input[i];
+  }
+
+  if (i + blockDim.x < N) {
+      sum += input[i + blockDim.x];
+  }
+
+  sum = blockReduceSum(sum);
+
+  if (threadIdx.x == 0) {
+      partial[blockIdx.x] = sum;
+  }
+}
+
+__global__ void reducePass2(const float* partial, float* output, int numPartials) {
+  float sum = 0.0f;
+
+  for (int i = threadIdx.x; i < numPartials; i += blockDim.x) {
+      sum += partial[i];
+  }
+
+  sum = blockReduceSum(sum);
+
+  if (threadIdx.x == 0) {
+      *output = sum;
+  }
+}
+
+
 __global__ void softmax1DOneBlock(const float *x, float *y, int N) {
   extern __shared__ float sdata[];
 
@@ -760,6 +841,63 @@ bool verifyReduceSum() {
   return checkScalar(gpuSum, cpuSum, 1e-2f, "reduceSum");
 }
 
+void launchReduceSumTwoPass(const float *d_in, float *d_out, int N,
+                            int blockSize = 256) {
+  if (N <= 0) {
+    CHECK_CUDA(cudaMemset(d_out, 0, sizeof(float)));
+    return;
+  }
+
+  if (N == 1) {
+    CHECK_CUDA(cudaMemcpy(d_out, d_in, sizeof(float),
+                          cudaMemcpyDeviceToDevice));
+    return;
+  }
+
+  const int gridSize1 = (N + 2 * blockSize - 1) / (2 * blockSize);
+  const size_t partialBytes = static_cast<size_t>(gridSize1) * sizeof(float);
+
+  float *d_partial = nullptr;
+  CHECK_CUDA(cudaMalloc((void **)&d_partial, partialBytes));
+
+  reducePass1<<<gridSize1, blockSize>>>(d_in, d_partial, N);
+  reducePass2<<<1, blockSize>>>(d_partial, d_out, gridSize1);
+
+  cudaFree(d_partial);
+}
+
+bool verifyReduceSumTwoPass() {
+  const int N = 1 << 18;
+  const size_t bytes = N * sizeof(float);
+
+  std::vector<float> h_x(N);
+  for (int i = 0; i < N; ++i) {
+    h_x[static_cast<size_t>(i)] =
+        std::sin(static_cast<float>(i) * 0.001f);
+  }
+
+  float *d_x = nullptr;
+  float *d_out = nullptr;
+  CHECK_CUDA(cudaMalloc((void **)&d_x, bytes));
+  CHECK_CUDA(cudaMalloc((void **)&d_out, sizeof(float)));
+  CHECK_CUDA(
+      cudaMemcpy(d_x, h_x.data(), bytes, cudaMemcpyHostToDevice));
+
+  const int blockSize = 256;
+  launchReduceSumTwoPass(d_x, d_out, N, blockSize);
+  CHECK_CUDA(cudaGetLastError());
+  CHECK_CUDA(cudaDeviceSynchronize());
+
+  float gpuSum = 0.0f;
+  CHECK_CUDA(cudaMemcpy(&gpuSum, d_out, sizeof(float),
+                        cudaMemcpyDeviceToHost));
+  const float cpuSum = reduceSumCPU(h_x);
+
+  cudaFree(d_x);
+  cudaFree(d_out);
+  return checkScalar(gpuSum, cpuSum, 1e-2f, "reduceSumTwoPass");
+}
+
 bool verifyReduceMax() {
   const int N = 1 << 18;
   const size_t bytes = N * sizeof(float);
@@ -965,6 +1103,7 @@ int main() {
          verifyVectorAddKernel("vectorAddGridStride",
                                launchVectorAddGridStride));
   report("reduceSum", verifyReduceSum());
+  report("reduceSumTwoPass", verifyReduceSumTwoPass());
   report("reduceMax", verifyReduceMax());
   report("softmax1D", verifySoftmax1D());
   report("histogramAtomicGlobal", verifyHistogram(false));
