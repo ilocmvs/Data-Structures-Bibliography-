@@ -48,7 +48,7 @@ class bst:
                 return node.right
             if not node.right:
                 return node.left
-            node.value = self._successor(node.right).value
+            node.value = self._successor(node).value
             node.right = self._delete(node.right, node.value)
         return node
     
