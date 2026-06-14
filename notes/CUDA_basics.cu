@@ -416,8 +416,8 @@ __global__ void histogramAtomicShared(const unsigned char *data, int *hist,
 // Kernel 1:
 // Performs block-local inclusive scan.
 // Also writes each block's total sum to blockSums[blockIdx.x].
-__global__ void scanBlockPrefixSumInclusive(const float *x, float *y, float *blockSums,
-                                   int N) {
+__global__ void scanBlockPrefixSumInclusive(const float *x, float *y,
+                                            float *blockSums, int N) {
   extern __shared__ float sdata[];
 
   int tid = threadIdx.x;
@@ -489,8 +489,8 @@ void scanRecursive(const float *d_input, float *d_output, int N,
   //
   // d_output now contains block-local prefix sums.
   // d_blockSums contains one total sum per block.
-  scanBlockPrefixSumInclusive<<<numBlocks, blockSize, sharedBytes>>>(d_input, d_output,
-                                                            d_blockSums, N);
+  scanBlockPrefixSumInclusive<<<numBlocks, blockSize, sharedBytes>>>(
+      d_input, d_output, d_blockSums, N);
 
   // If there is only one block, the local scan is already the global scan.
   if (numBlocks == 1) {
@@ -658,6 +658,64 @@ __global__ void layerNormForwardKernel(const float *__restrict__ X,
   }
 }
 
+__global__ void flagPositive(const float *__restrict__ x,
+                             float *__restrict__ flag, int N) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (idx < N) {
+    flag[idx] = x[idx] > 0.0f ? 1.0f : 0.0f;
+  }
+}
+
+__global__ void scatterPositive(const float *__restrict__ x,
+                                const float *__restrict__ prefix,
+                                float *__restrict__ output, int N) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (idx < N) {
+    float val = x[idx];
+
+    if (val > 0.0f) {
+      int outIdx = static_cast<int>(prefix[idx]) - 1;
+      output[outIdx] = val;
+    }
+  }
+}
+
+__global__ void writeOutputCount(const float *__restrict__ prefix,
+                                 int *__restrict__ outputCount, int N) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    *outputCount = static_cast<int>(prefix[N - 1]);
+  }
+}
+
+void filterAndCompaction(const float *d_input, float *d_output,
+                         int *d_outputCount, int N, int blockSize) {
+  if (N == 0) {
+    cudaMemset(d_outputCount, 0, sizeof(int));
+    return;
+  }
+
+  float *d_flag = nullptr;
+  float *d_prefix = nullptr;
+
+  cudaMalloc(&d_flag, sizeof(float) * N);
+  cudaMalloc(&d_prefix, sizeof(float) * N);
+
+  int gridSize = (N + blockSize - 1) / blockSize;
+
+  flagPositive<<<gridSize, blockSize>>>(d_input, d_flag, N);
+
+  scanRecursive(d_flag, d_prefix, N, blockSize);
+
+  scatterPositive<<<gridSize, blockSize>>>(d_input, d_prefix, d_output, N);
+
+  writeOutputCount<<<1, 1>>>(d_prefix, d_outputCount, N);
+
+  cudaFree(d_flag);
+  cudaFree(d_prefix);
+}
+
 /* CPU verifications */
 void vectorAddCPU(const std::vector<float> &A, const std::vector<float> &B,
                   std::vector<float> &C) {
@@ -740,6 +798,17 @@ void layerNormForwardCPU(const float *X, const float *gamma, const float *beta,
 
     for (int col = 0; col < hidden_dim; ++col) {
       y_row[col] = gamma[col] * (x_row[col] - mean) * inv_std + beta[col];
+    }
+  }
+}
+
+void filterAndCompactionCPU(const std::vector<float> &input,
+                            std::vector<float> &output) {
+  output.clear();
+  output.reserve(input.size());
+  for (float v : input) {
+    if (v > 0.0f) {
+      output.push_back(v);
     }
   }
 }
@@ -1099,6 +1168,64 @@ bool verifyLayerNorm() {
   return checkResult(h_Y, h_ref, 1e-4f, "layerNorm");
 }
 
+bool verifyFilterAndCompaction() {
+  const int N = 1 << 18;
+  const int blockSize = 256;
+  const size_t bytes = static_cast<size_t>(N) * sizeof(float);
+
+  std::vector<float> h_input(N);
+  for (int i = 0; i < N; ++i) {
+    const float v = std::sin(static_cast<float>(i) * 0.013f);
+    h_input[static_cast<size_t>(i)] = v;
+  }
+
+  std::vector<float> h_ref;
+  filterAndCompactionCPU(h_input, h_ref);
+
+  float *d_input = nullptr;
+  float *d_output = nullptr;
+  int *d_outputCount = nullptr;
+  CHECK_CUDA(cudaMalloc((void **)&d_input, bytes));
+  CHECK_CUDA(cudaMalloc((void **)&d_output, bytes));
+  CHECK_CUDA(cudaMalloc((void **)&d_outputCount, sizeof(int)));
+  CHECK_CUDA(
+      cudaMemcpy(d_input, h_input.data(), bytes, cudaMemcpyHostToDevice));
+
+  filterAndCompaction(d_input, d_output, d_outputCount, N, blockSize);
+  CHECK_CUDA(cudaGetLastError());
+  CHECK_CUDA(cudaDeviceSynchronize());
+
+  int gpuCount = 0;
+  CHECK_CUDA(
+      cudaMemcpy(&gpuCount, d_outputCount, sizeof(int), cudaMemcpyDeviceToHost));
+  if (gpuCount < 0 || gpuCount > N) {
+    std::cerr << "filterAndCompaction: invalid output count " << gpuCount
+              << std::endl;
+    cudaFree(d_input);
+    cudaFree(d_output);
+    cudaFree(d_outputCount);
+    return false;
+  }
+
+  std::vector<float> h_output(static_cast<size_t>(gpuCount), 0.0f);
+  if (gpuCount > 0) {
+    CHECK_CUDA(cudaMemcpy(h_output.data(), d_output, sizeof(float) * gpuCount,
+                          cudaMemcpyDeviceToHost));
+  }
+
+  cudaFree(d_input);
+  cudaFree(d_output);
+  cudaFree(d_outputCount);
+
+  if (static_cast<int>(h_ref.size()) != gpuCount) {
+    std::cerr << "filterAndCompaction: count mismatch GPU=" << gpuCount
+              << " CPU=" << h_ref.size() << std::endl;
+    return false;
+  }
+
+  return checkResult(h_output, h_ref, 1e-5f, "filterAndCompaction");
+}
+
 int main() {
   int failures = 0;
 
@@ -1124,6 +1251,7 @@ int main() {
   report("histogramAtomicShared", verifyHistogram(true));
   report("inclusiveScanBlock", verifyInclusiveScanBlock());
   report("layerNormForward", verifyLayerNorm());
+  report("filterAndCompaction", verifyFilterAndCompaction());
 
   if (failures == 0) {
     std::cout << "All kernel checks passed." << std::endl;
